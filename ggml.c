@@ -43,6 +43,13 @@
 
 float sparse_pred_threshold = 0.;
 
+// Sparse matrix dump state
+int    sparse_dump_layer      = -1;
+char   sparse_dump_dir[256]   = "";
+int    sparse_dump_max_tokens = 1;
+int    sparse_dump_token_ctr  = 0;
+static int sparse_dump_initialized = 0;
+
 #if defined(_WIN32)
 
 typedef HANDLE pthread_t;
@@ -592,6 +599,141 @@ static const ggml_type_traits_t type_traits[GGML_TYPE_COUNT] = {
 ggml_type_traits_t ggml_internal_get_type_traits(enum ggml_type type) {
     GGML_ASSERT(type < GGML_TYPE_COUNT);
     return type_traits[type];
+}
+
+//
+// Sparse matrix dump helpers
+//
+
+void ggml_sparse_dump_init(void) {
+    if (sparse_dump_initialized) return;
+    sparse_dump_initialized = 1;
+    const char *dir    = getenv("POWERINFER_DUMP_SPARSE_DIR");
+    const char *layer  = getenv("POWERINFER_DUMP_SPARSE_LAYER");
+    const char *tokens = getenv("POWERINFER_DUMP_SPARSE_TOKENS");
+    if (dir && dir[0]) {
+        snprintf(sparse_dump_dir, sizeof(sparse_dump_dir), "%s", dir);
+#if defined(_WIN32)
+        _mkdir(sparse_dump_dir);
+#else
+        mkdir(sparse_dump_dir, 0755);
+#endif
+    }
+    if (layer)  sparse_dump_layer = atoi(layer);
+    if (tokens) sparse_dump_max_tokens = atoi(tokens);
+    if (sparse_dump_max_tokens < 1) sparse_dump_max_tokens = 1;
+}
+
+static int parse_layer_from_name(const char *name) {
+    // Parse "blk.{N}.ffn_..." -> returns N, or -1
+    if (!name) return -1;
+    const char *p = strstr(name, "blk.");
+    if (!p) return -1;
+    p += 4; // skip "blk."
+    char *end;
+    long val = strtol(p, &end, 10);
+    if (end == p) return -1;
+    return (int)val;
+}
+
+static const char * parse_op_from_name(const char *name) {
+    // Parse "blk.N.ffn_{gate|up|down|down_t}..." -> returns op string
+    if (!name) return NULL;
+    const char *p = strstr(name, ".ffn_");
+    if (!p) return NULL;
+    p += 5; // skip ".ffn_"
+    if (strncmp(p, "gate", 4) == 0) return "gate";
+    if (strncmp(p, "up",   2) == 0) return "up";
+    if (strncmp(p, "down_t", 6) == 0) return "down_t";
+    if (strncmp(p, "down", 4) == 0) return "down";
+    return NULL;
+}
+
+static void write_npy_header(FILE *fp, int64_t nrows, int64_t ncols) {
+    // Write numpy v1.0 format header for float32 2D array
+    const char magic[] = "\x93NUMPY\x01\x00";
+    char dict[128];
+    int dict_len = snprintf(dict, sizeof(dict),
+        "{'descr': '<f4', 'fortran_order': False, 'shape': (%lld, %lld), }",
+        (long long)nrows, (long long)ncols);
+    // Pad header to 64-byte alignment (magic=8 + header_len=2 + dict + '\n')
+    int total = 10 + dict_len + 1; // +1 for trailing newline
+    int pad = (64 - (total % 64)) % 64;
+    uint16_t header_len = (uint16_t)(dict_len + pad + 1);
+
+    fwrite(magic, 1, 8, fp);
+    fwrite(&header_len, 2, 1, fp);
+    fwrite(dict, 1, dict_len, fp);
+    for (int i = 0; i < pad; i++) fputc(' ', fp);
+    fputc('\n', fp);
+}
+
+void ggml_dump_sparsified_npy(
+        const char * path,
+        const struct ggml_tensor * weights,
+        const float * activation_scores,
+        float threshold,
+        int64_t nrows,
+        int64_t ncols,
+        int group_size) {
+    // group_size: 1 = per-neuron scores, 128 = grouped (head variant)
+    // For grouped: activation_scores[i/group_size] < group_threshold means inactive
+    const float group_threshold = -7.0f; // matches head variant threshold
+
+    float *buf = (float *)malloc((size_t)nrows * ncols * sizeof(float));
+    if (!buf) {
+        fprintf(stderr, "ggml_dump_sparsified_npy: allocation failed for %lldx%lld\n",
+                (long long)nrows, (long long)ncols);
+        return;
+    }
+
+    ggml_to_float_t to_float = type_traits[weights->type].to_float;
+
+    for (int64_t i = 0; i < nrows; i++) {
+        float *row_out = buf + i * ncols;
+        bool active;
+        if (group_size <= 1) {
+            active = (activation_scores[i] >= threshold);
+        } else {
+            int gid = (int)(i / group_size);
+            active = (activation_scores[gid] >= group_threshold);
+        }
+
+        if (!active) {
+            memset(row_out, 0, ncols * sizeof(float));
+        } else {
+            const char *row_data = (const char *)weights->data + i * weights->nb[1];
+            if (weights->type == GGML_TYPE_F32) {
+                memcpy(row_out, row_data, ncols * sizeof(float));
+            } else {
+                to_float(row_data, row_out, (int)ncols);
+            }
+        }
+    }
+
+    FILE *fp = fopen(path, "wb");
+    if (!fp) {
+        fprintf(stderr, "ggml_dump_sparsified_npy: cannot open %s\n", path);
+        free(buf);
+        return;
+    }
+    write_npy_header(fp, nrows, ncols);
+    fwrite(buf, sizeof(float), (size_t)(nrows * ncols), fp);
+    fclose(fp);
+    free(buf);
+
+    fprintf(stderr, "sparse_dump: wrote %s (%lldx%lld)\n", path, (long long)nrows, (long long)ncols);
+}
+
+static void sparse_dump_build_path(char *path, size_t pathsz,
+        int layer, const char *op, const char *device) {
+    if (sparse_dump_max_tokens > 1) {
+        snprintf(path, pathsz, "%s/layer%d_%s_token%d_%s.npy",
+                 sparse_dump_dir, layer, op, sparse_dump_token_ctr, device);
+    } else {
+        snprintf(path, pathsz, "%s/layer%d_%s_%s.npy",
+                 sparse_dump_dir, layer, op, device);
+    }
 }
 
 //
@@ -13917,6 +14059,19 @@ static void ggml_compute_forward_mul_mat_sparse_head(
     }
 
     if (params->type == GGML_TASK_FINALIZE) {
+        if (sparse_dump_dir[0] && sparse_dump_layer >= 0
+                && sparse_dump_token_ctr < sparse_dump_max_tokens) {
+            int layer = parse_layer_from_name(src0->name);
+            if (layer == sparse_dump_layer) {
+                const char *op = parse_op_from_name(src0->name);
+                if (op) {
+                    float *ffdata_dump = (float *)dst->src[2]->data;
+                    char path[512];
+                    sparse_dump_build_path(path, sizeof(path), layer, op, "cpu");
+                    ggml_dump_sparsified_npy(path, src0, ffdata_dump, 0.0f, ne01, ne00, 128);
+                }
+            }
+        }
         return;
     }
 
@@ -14159,6 +14314,19 @@ static void ggml_compute_forward_mul_mat_sparse(
     }
 
     if (params->type == GGML_TASK_FINALIZE) {
+        if (sparse_dump_dir[0] && sparse_dump_layer >= 0
+                && sparse_dump_token_ctr < sparse_dump_max_tokens) {
+            int layer = parse_layer_from_name(src0->name);
+            if (layer == sparse_dump_layer) {
+                const char *op = parse_op_from_name(src0->name);
+                if (op) {
+                    float *ffdata_dump = (float *)dst->src[2]->data;
+                    char path[512];
+                    sparse_dump_build_path(path, sizeof(path), layer, op, "cpu");
+                    ggml_dump_sparsified_npy(path, src0, ffdata_dump, threshold, ne01, ne00, 1);
+                }
+            }
+        }
         return;
     }
 
@@ -14377,6 +14545,19 @@ static void ggml_compute_forward_mul_mat_axpy(
     }
 
     if (params->type == GGML_TASK_FINALIZE) {
+        if (sparse_dump_dir[0] && sparse_dump_layer >= 0
+                && sparse_dump_token_ctr < sparse_dump_max_tokens) {
+            int layer = parse_layer_from_name(src0->name);
+            if (layer == sparse_dump_layer) {
+                const char *op = parse_op_from_name(src0->name);
+                if (op) {
+                    float *scores_dump = (float *)dst->src[2]->data;
+                    char path[512];
+                    sparse_dump_build_path(path, sizeof(path), layer, op, "cpu");
+                    ggml_dump_sparsified_npy(path, src0, scores_dump, threshold, ne01, ne00, 1);
+                }
+            }
+        }
         return;
     }
 
@@ -14384,7 +14565,7 @@ static void ggml_compute_forward_mul_mat_axpy(
     const size_t row_size = ne10*ggml_type_size(vec_dot_type)/ggml_blck_size(vec_dot_type);
 
     struct ggml_tensor *src2 = dst->src[2];
-    
+
     // parallelize by src0 rows
     // const int64_t dr = (src2->ne[0] + 8*nth - 1)/(8*nth);
     const int64_t dr = (ne01 + nth - 1)/(nth);
@@ -14527,6 +14708,19 @@ static void ggml_compute_forward_mul_mat_axpy_q4_0(
     }
 
     if (params->type == GGML_TASK_FINALIZE) {
+        if (sparse_dump_dir[0] && sparse_dump_layer >= 0
+                && sparse_dump_token_ctr < sparse_dump_max_tokens) {
+            int layer = parse_layer_from_name(src0->name);
+            if (layer == sparse_dump_layer) {
+                const char *op = parse_op_from_name(src0->name);
+                if (op) {
+                    float *scores_dump = (float *)dst->src[2]->data;
+                    char path[512];
+                    sparse_dump_build_path(path, sizeof(path), layer, op, "cpu");
+                    ggml_dump_sparsified_npy(path, src0, scores_dump, threshold, ne01, ne00, 1);
+                }
+            }
+        }
         return;
     }
 
@@ -14534,7 +14728,7 @@ static void ggml_compute_forward_mul_mat_axpy_q4_0(
     const size_t row_size = ne10*ggml_type_size(vec_dot_type)/ggml_blck_size(vec_dot_type);
 
     struct ggml_tensor *src2 = dst->src[2];
-    
+
     // parallelize by src0 rows
     // const int64_t dr = (src2->ne[0] + 8*nth - 1)/(8*nth);
     const int64_t dr = (src2->ne[0] + nth - 1)/(nth);

@@ -6764,6 +6764,8 @@ static struct ggml_cgraph * llama_build_graph(
 static int llama_decode_internal(
          llama_context & lctx,
            llama_batch   batch) {
+    ggml_sparse_dump_init();
+
     const uint32_t n_tokens = batch.n_tokens;
 
     if (n_tokens == 0) {
@@ -7001,6 +7003,8 @@ static int llama_decode_internal(
         lctx.t_load_us = ggml_time_us() - lctx.t_start_us;
         lctx.has_evaluated_once = true;
     }
+
+    sparse_dump_token_ctr++;
 
     return 0;
 }

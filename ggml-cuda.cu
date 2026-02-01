@@ -8784,8 +8784,89 @@ static void ggml_cuda_mul_mat(const ggml_tensor * src0, const ggml_tensor * src1
     }
 }
 
+static void ggml_cuda_sparse_dump_check(const ggml_tensor * src0, ggml_tensor * dst, const char * device_tag) {
+    if (!sparse_dump_dir[0] || sparse_dump_layer < 0
+            || sparse_dump_token_ctr >= sparse_dump_max_tokens) return;
+    int layer = -1;
+    const char *op = NULL;
+    // Parse from src0 name
+    if (src0->name[0]) {
+        const char *p = strstr(src0->name, "blk.");
+        if (p) {
+            p += 4;
+            char *end;
+            long val = strtol(p, &end, 10);
+            if (end != p) layer = (int)val;
+        }
+        const char *q = strstr(src0->name, ".ffn_");
+        if (q) {
+            q += 5;
+            if (strncmp(q, "gate", 4) == 0) op = "gate";
+            else if (strncmp(q, "up",   2) == 0) op = "up";
+            else if (strncmp(q, "down_t", 6) == 0) op = "down_t";
+            else if (strncmp(q, "down", 4) == 0) op = "down";
+        }
+    }
+    if (layer != sparse_dump_layer || !op) return;
+
+    const int64_t nrows = src0->ne[1];
+    const int64_t ncols = src0->ne[0];
+    const size_t weight_bytes = ggml_nbytes(src0);
+
+    // Copy activation scores from device/host
+    const ggml_tensor * src2 = dst->src[2];
+    const int64_t nscore = src2->ne[0];
+    float *scores_host = (float *)malloc(nscore * sizeof(float));
+    if (!scores_host) return;
+
+    if (src2->backend == GGML_BACKEND_CPU) {
+        memcpy(scores_host, src2->data, nscore * sizeof(float));
+    } else {
+        void *dev_ptr = ((ggml_tensor_extra_gpu *)src2->extra)->data_device[g_main_device];
+        CUDA_CHECK(ggml_cuda_set_device(g_main_device));
+        cudaStream_t stream = g_cudaStreams[g_main_device][0];
+        cudaMemcpyAsync(scores_host, dev_ptr, nscore * sizeof(float), cudaMemcpyDeviceToHost, stream);
+        cudaStreamSynchronize(stream);
+    }
+
+    // Copy weight data from device to host
+    char *weight_host = (char *)malloc(weight_bytes);
+    if (!weight_host) { free(scores_host); return; }
+
+    if (src0->backend == GGML_BACKEND_CPU) {
+        memcpy(weight_host, src0->data, weight_bytes);
+    } else {
+        void *dev_ptr = ((ggml_tensor_extra_gpu *)src0->extra)->data_device[g_main_device];
+        CUDA_CHECK(ggml_cuda_set_device(g_main_device));
+        cudaStream_t stream = g_cudaStreams[g_main_device][0];
+        cudaMemcpyAsync(weight_host, dev_ptr, weight_bytes, cudaMemcpyDeviceToHost, stream);
+        cudaStreamSynchronize(stream);
+    }
+
+    // Create a temporary tensor descriptor for the dump helper
+    ggml_tensor tmp_weights = *src0;
+    tmp_weights.data = weight_host;
+
+    char path[512];
+    if (sparse_dump_max_tokens > 1) {
+        snprintf(path, sizeof(path), "%s/layer%d_%s_token%d_%s.npy",
+                 sparse_dump_dir, layer, op, sparse_dump_token_ctr, device_tag);
+    } else {
+        snprintf(path, sizeof(path), "%s/layer%d_%s_%s.npy",
+                 sparse_dump_dir, layer, op, device_tag);
+    }
+
+    ggml_dump_sparsified_npy(path, &tmp_weights, scores_host, sparse_pred_threshold, nrows, ncols, 1);
+
+    free(scores_host);
+    free(weight_host);
+}
+
 static void ggml_cuda_mul_mat_sparse(const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
     GGML_ASSERT(dst->src[2] != NULL && "dst->src[2] must be present for sparse matrix multiplication");
+
+    ggml_cuda_sparse_dump_check(src0, dst, "gpu");
+
     if (src1->ne[1] == 1 && src0->ne[0] % GGML_CUDA_DMMV_X == 0) {
         switch(src0->type) {
             case GGML_TYPE_F16:
@@ -8804,6 +8885,9 @@ static void ggml_cuda_mul_mat_sparse(const ggml_tensor * src0, const ggml_tensor
 
 void ggml_cuda_axpy(const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
     GGML_ASSERT(dst->src[2] != NULL && "dst->src[2] must be present for axpy");
+
+    ggml_cuda_sparse_dump_check(src0, dst, "gpu");
+
     bool all_on_device = (src0->backend == GGML_BACKEND_GPU || src0->backend == GGML_BACKEND_GPU_SPLIT) &&
         src1->backend == GGML_BACKEND_GPU && dst->backend == GGML_BACKEND_GPU;
     if (src1->ne[1] > 100) {

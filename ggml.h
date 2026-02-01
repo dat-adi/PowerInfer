@@ -2218,6 +2218,22 @@ extern "C" {
     // TODO: these should be moved to the context
     extern float sparse_pred_threshold;
 
+    // Sparse matrix dump for visualization (controlled by env vars)
+    extern int    sparse_dump_layer;
+    extern char   sparse_dump_dir[256];
+    extern int    sparse_dump_max_tokens;
+    extern int    sparse_dump_token_ctr;
+
+    GGML_API void ggml_sparse_dump_init(void);
+    GGML_API void ggml_dump_sparsified_npy(
+        const char * path,
+        const struct ggml_tensor * weights,
+        const float * activation_scores,
+        float threshold,
+        int64_t nrows,
+        int64_t ncols,
+        int group_size);
+
     //
     // Internal types and functions exposed for tests and benchmarks
     //
