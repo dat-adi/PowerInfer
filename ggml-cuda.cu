@@ -8844,7 +8844,8 @@ static void ggml_cuda_sparse_dump_check(const ggml_tensor * src0, ggml_tensor * 
     }
 
     // Create a temporary tensor descriptor for the dump helper
-    ggml_tensor tmp_weights = *src0;
+    ggml_tensor tmp_weights;
+    memcpy(&tmp_weights, src0, sizeof(ggml_tensor));
     tmp_weights.data = weight_host;
 
     char path[512];
