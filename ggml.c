@@ -622,6 +622,8 @@ void ggml_sparse_dump_init(void) {
     if (layer)  sparse_dump_layer = atoi(layer);
     if (tokens) sparse_dump_max_tokens = atoi(tokens);
     if (sparse_dump_max_tokens < 1) sparse_dump_max_tokens = 1;
+    fprintf(stderr, "sparse_dump: dir=\"%s\" layer=%d max_tokens=%d\n",
+            sparse_dump_dir, sparse_dump_layer, sparse_dump_max_tokens);
 }
 
 static int parse_layer_from_name(const char *name) {
@@ -14875,6 +14877,19 @@ static void ggml_compute_forward_mul_mat_axpy_head(
     }
 
     if (params->type == GGML_TASK_FINALIZE) {
+        if (sparse_dump_dir[0] && sparse_dump_layer >= 0
+                && sparse_dump_token_ctr < sparse_dump_max_tokens) {
+            int layer = parse_layer_from_name(src0->name);
+            if (layer == sparse_dump_layer) {
+                const char *op = parse_op_from_name(src0->name);
+                if (op) {
+                    float *scores_dump = (float *)dst->src[2]->data;
+                    char path[512];
+                    sparse_dump_build_path(path, sizeof(path), layer, op, "cpu");
+                    ggml_dump_sparsified_npy(path, src0, scores_dump, sparse_pred_threshold, ne01, ne00, 1);
+                }
+            }
+        }
         return;
     }
 

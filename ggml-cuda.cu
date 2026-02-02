@@ -8817,7 +8817,11 @@ static void ggml_cuda_sparse_dump_check(const ggml_tensor * src0, ggml_tensor * 
     const ggml_tensor * src2 = dst->src[2];
     const int64_t nscore = src2->ne[0];
     float *scores_host = (float *)malloc(nscore * sizeof(float));
-    if (!scores_host) return;
+    if (!scores_host) {
+        fprintf(stderr, "sparse_dump: failed to allocate %lld bytes for scores (tensor %s)\n",
+                (long long)(nscore * sizeof(float)), src0->name);
+        return;
+    }
 
     if (src2->backend == GGML_BACKEND_CPU) {
         memcpy(scores_host, src2->data, nscore * sizeof(float));
@@ -8831,7 +8835,12 @@ static void ggml_cuda_sparse_dump_check(const ggml_tensor * src0, ggml_tensor * 
 
     // Copy weight data from device to host
     char *weight_host = (char *)malloc(weight_bytes);
-    if (!weight_host) { free(scores_host); return; }
+    if (!weight_host) {
+        fprintf(stderr, "sparse_dump: failed to allocate %zu bytes for weights (tensor %s)\n",
+                weight_bytes, src0->name);
+        free(scores_host);
+        return;
+    }
 
     if (src0->backend == GGML_BACKEND_CPU) {
         memcpy(weight_host, src0->data, weight_bytes);
