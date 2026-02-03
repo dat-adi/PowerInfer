@@ -1933,6 +1933,8 @@ static void ggml_setup_op_has_task_pass(void) {
     {   // FINALIZE
         bool * p = GGML_OP_HAS_FINALIZE;
 
+        p[GGML_OP_MUL_MAT_SPARSE         ] = true;
+        p[GGML_OP_AXPY                   ] = true;
         p[GGML_OP_CROSS_ENTROPY_LOSS     ] = true;
     }
 }
